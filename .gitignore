@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# generated build artifacts
+_minified/
+_formatted/
+dist/
+build/
+
+# local secrets / env (the AI key is stored in the browser, never in files —
+# this is belt-and-suspenders in case anyone adds one later)
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+*credential*
+
+# os / editor
+.DS_Store
+*.log
+.vscode/
+.idea/

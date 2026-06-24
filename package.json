@@ -1,0 +1,21 @@
+{
+  "name": "cms-static",
+  "version": "0.1.0",
+  "description": "Zero-config local CMS layer for any static HTML/CSS/JS site folder.",
+  "bin": {
+    "cms-static": "./bin/cli.js"
+  },
+  "scripts": {
+    "start": "node bin/cli.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
+    "js-beautify": "^1.15.4",
+    "multer": "^1.4.5-lts.1",
+    "sharp": "^0.33.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

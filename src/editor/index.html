@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>cms-static</title>
+  <link rel="stylesheet" href="editor.css">
+  <link rel="stylesheet" href="https://unpkg.com/cropperjs@1.6.1/dist/cropper.min.css">
+</head>
+<body>
+  <div class="layout" id="layout">
+    <aside class="sidebar" id="sidebar">
+      <button class="sidebar-toggle" id="sidebarToggle"
+              aria-label="Collapse sidebar" title="Collapse sidebar (Ctrl/⌘ B)">
+        <span class="sidebar-toggle-icon" aria-hidden="true">«</span>
+      </button>
+      <div class="sidebar-resizer" id="sidebarResizer" aria-hidden="true"></div>
+      <header class="sidebar-head">
+        <div class="brand">
+          <strong>cms-static</strong>
+          <span class="muted" id="rootLabel"></span>
+        </div>
+        <select id="pagePicker" aria-label="Page"></select>
+      </header>
+
+      <div class="git-panel" id="gitPanel" hidden></div>
+
+      <div class="sidebar-body" id="fieldsBody">
+        <p class="muted center">Pick a page above to start editing.</p>
+      </div>
+
+      <!-- AI: chat panel (slides up from bottom of sidebar) -->
+      <div class="chat-panel" id="chatPanel" hidden>
+        <header class="chat-head">
+          <strong>✨ AI Assistant</strong>
+          <button class="chat-close" id="chatClose" aria-label="Close chat">✕</button>
+        </header>
+        <div class="chat-scope-row">
+          <label class="chat-scope-label" for="chatScope">Working on:</label>
+          <select id="chatScope" class="chat-scope">
+            <!-- options populated by ai.js when panel opens -->
+          </select>
+          <button class="chat-key-btn" id="chatKeyBtn" title="Update API key" aria-label="Update API key">⚙</button>
+        </div>
+        <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+        <div class="chat-input-row">
+          <textarea id="chatInput" rows="1" placeholder="Type a message…"></textarea>
+          <button id="chatSend" class="btn primary chat-send" aria-label="Send">↑</button>
+        </div>
+      </div>
+
+      <footer class="sidebar-foot">
+        <button id="saveBtn" class="btn primary save-btn" disabled>
+          <span class="save-btn-label">Save</span>
+          <span class="kbd-hint" aria-hidden="true">⌘ S</span>
+        </button>
+        <button id="buildBtn" class="btn" title="Run minify + format pipelines">⬇ Build</button>
+        <button id="aiFab" class="btn ai-fab" title="AI assistant — chat to edit">✨ AI</button>
+        <span id="statusBar" class="status muted" aria-live="polite"></span>
+      </footer>
+    </aside>
+
+    <main class="preview">
+      <div class="preview-toolbar">
+        <span id="previewPath" class="muted">No page loaded</span>
+        <button id="refreshBtn" class="btn small" title="Reload preview">⟳</button>
+        <a id="openInTab" class="btn small" target="_blank" rel="noopener" hidden>↗ Open</a>
+      </div>
+      <iframe id="preview" src="about:blank" title="preview"></iframe>
+    </main>
+  </div>
+
+  <!-- D1: stack of toast notifications, bottom-right -->
+  <div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="false"></div>
+
+  <!-- AI: API-key setup dialog -->
+  <dialog id="aiKeyDialog" class="ai-key-dialog">
+    <form method="dialog" class="ai-key-wrap">
+      <h2>Connect your NVIDIA API key</h2>
+      <p class="muted small">
+        Powered by Gemma 4 via NVIDIA. Get a key at
+        <a href="https://build.nvidia.com/" target="_blank" rel="noopener">build.nvidia.com</a>.
+      </p>
+      <div class="ai-key-field">
+        <input type="password" id="aiKeyInput" placeholder="nvapi-…" autocomplete="off" spellcheck="false">
+      </div>
+      <label class="ai-key-remember">
+        <input type="checkbox" id="aiKeyRemember" checked>
+        Remember on this browser
+      </label>
+      <p class="muted small ai-key-disclosure">
+        Editing with AI sends the field text + your message to NVIDIA's hosted Gemma 4
+        via the local cms-static proxy. Your key is stored only in this browser and
+        passed straight through &mdash; never logged.
+      </p>
+      <div class="ai-key-actions">
+        <button type="button" id="aiKeyClear" class="btn" hidden>Clear key</button>
+        <span style="flex:1"></span>
+        <button type="button" id="aiKeyCancel" class="btn">Cancel</button>
+        <button type="button" id="aiKeySave" class="btn primary">Save &amp; continue</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- C3: keyboard shortcuts cheat-sheet -->
+  <button class="kbd-help-btn" id="kbdHelpBtn" type="button"
+          aria-label="Show keyboard shortcuts" title="Keyboard shortcuts (?)">?</button>
+  <dialog id="kbdHelpDialog" class="kbd-dialog">
+    <form method="dialog" class="kbd-wrap">
+      <h2>Keyboard shortcuts</h2>
+      <ul class="kbd-list">
+        <li><span class="kbd-keys"><kbd>⌘</kbd>+<kbd>S</kbd></span><span>Save changes</span></li>
+        <li><span class="kbd-keys"><kbd>⌘</kbd>+<kbd>B</kbd></span><span>Toggle the sidebar</span></li>
+        <li><span class="kbd-keys"><kbd>?</kbd></span><span>Show this list</span></li>
+        <li><span class="kbd-keys"><kbd>Esc</kbd></span><span>Close any open dialog</span></li>
+      </ul>
+      <p class="muted small">On Windows / Linux, use <kbd>Ctrl</kbd> instead of <kbd>⌘</kbd>.</p>
+      <div class="kbd-actions">
+        <button type="button" class="btn primary" id="kbdHelpClose">Got it</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="gitOnboardDialog" class="git-dialog">
+    <form method="dialog" class="git-wrap">
+      <h2>Set up version control</h2>
+      <p class="muted small">This folder is not a Git repository yet. Pick how you want to start.</p>
+
+      <fieldset class="git-choice">
+        <label class="choice">
+          <input type="radio" name="onboardMode" value="local" checked>
+          <span>
+            <strong>Initialize a new local repo</strong>
+            <span class="muted small">Just <code>git init</code>. You can connect a remote later.</span>
+          </span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="onboardMode" value="remote">
+          <span>
+            <strong>Initialize and connect to an existing remote</strong>
+            <span class="muted small">For pushing to GitHub, Bitbucket, GitLab, etc.</span>
+          </span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="onboardMode" value="skip">
+          <span>
+            <strong>Skip — don't use Git</strong>
+            <span class="muted small">No version control for this session. You can enable it later.</span>
+          </span>
+        </label>
+      </fieldset>
+
+      <div class="git-field" id="onboardRemoteRow" hidden>
+        <label for="onboardRemoteUrl">Remote URL</label>
+        <input type="text" id="onboardRemoteUrl" placeholder="git@github.com:user/repo.git">
+        <small class="muted">Make sure the remote already exists. The CMS won't create it for you.</small>
+      </div>
+
+      <div class="git-field">
+        <label for="onboardMessage">First commit message</label>
+        <input type="text" id="onboardMessage" value="Initial commit from cms-static">
+      </div>
+
+      <div class="git-actions">
+        <button type="button" id="onboardCancel" class="btn">Cancel</button>
+        <button type="button" id="onboardOk" class="btn primary">Set up Git</button>
+      </div>
+      <p class="git-error muted small" id="onboardError"></p>
+    </form>
+  </dialog>
+
+  <!-- J: confirm-on-refresh when there are unsaved edits -->
+  <dialog id="refreshConfirmDialog" class="draft-dialog">
+    <form method="dialog" class="draft-wrap">
+      <h2>Reload page?</h2>
+      <p class="muted small">
+        You have <strong><span class="draft-count">0</span> unsaved edit<span class="draft-count-plural">s</span></strong> on this page.
+        Reloading without saving will lose them.
+      </p>
+      <div class="draft-actions">
+        <button type="button" id="draftCancelReload" class="btn">Cancel</button>
+        <span style="flex:1"></span>
+        <button type="button" id="draftDiscardReload" class="btn">Discard &amp; reload</button>
+        <button type="button" id="draftSaveReload" class="btn primary">Save &amp; reload</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="cropDialog" class="crop-dialog">
+    <form method="dialog" class="crop-wrap">
+      <h2>Crop &amp; replace image</h2>
+      <div class="crop-toolbar">
+        <label>
+          Aspect:
+          <select id="aspectSel">
+            <option value="">Free</option>
+            <option value="match">Match original</option>
+            <option value="1.7777777">16:9</option>
+            <option value="1.3333333">4:3</option>
+            <option value="1.5">3:2</option>
+            <option value="1">1:1</option>
+            <option value="0.6666666">2:3 (portrait)</option>
+          </select>
+        </label>
+        <span class="muted small" id="cropMeta"></span>
+      </div>
+      <div class="crop-canvas-wrap">
+        <img id="cropImage" alt="">
+      </div>
+      <div class="crop-actions">
+        <button type="button" id="cropCancel" class="btn">Cancel</button>
+        <button type="button" id="cropOk" class="btn primary">Save crop</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/cropperjs@1.6.1/dist/cropper.min.js"></script>
+  <script src="editor.js"></script>
+  <script src="cropper-modal.js"></script>
+  <script src="git-panel.js"></script>
+  <script src="ai.js"></script>
+  <script src="inline-edit.js"></script>
+  <script src="drafts.js"></script>
+  <script src="validation.js"></script>
+</body>
+</html>
