@@ -27,6 +27,14 @@
   const STORAGE_PREFIX = 'cms-static.draft.';
   const DEBOUNCE_MS = 400;
 
+  // Draft keys are scoped by workspace id so folder A's edits never resurface
+  // when a different folder B (with a same-named page like index.html) is
+  // dropped later. Falls back to 'classic' when no id is present.
+  function workspaceId() {
+    const ws = window.cmsState && window.cmsState.workspace;
+    return (ws && ws.id) ? ws.id : 'classic';
+  }
+
   // Debounce handle; null when no pending write.
   let pendingPersist = null;
   // The restore-banner element currently in the sidebar, if any.
@@ -37,7 +45,19 @@
   // ---------------------------------------------------------------------
 
   function keyFor(pagePath) {
-    return STORAGE_PREFIX + pagePath;
+    return STORAGE_PREFIX + workspaceId() + '.' + pagePath;
+  }
+
+  // Drop every draft key that isn't for the current workspace. Called when a
+  // workspace is loaded/swapped so stale drafts can't leak across folders.
+  function purgeOtherWorkspaces() {
+    const keep = STORAGE_PREFIX + workspaceId() + '.';
+    const toRemove = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(STORAGE_PREFIX) && !k.startsWith(keep)) toRemove.push(k);
+    }
+    for (const k of toRemove) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
   }
 
   function persistNow() {
@@ -128,8 +148,12 @@
   function applyDraft(draft) {
     const state = window.cmsState;
     if (!state) return;
-    for (const [id, value] of draft.changed || []) state.changed.set(id, value);
-    for (const [id, value] of draft.changedAlt || []) state.changedAlt.set(id, value);
+    // Only apply ids that still exist in the freshly-extracted fields. Field ids
+    // are positional (h1:3, img:12…) so a draft from a different DOM must never
+    // be blindly replayed onto whatever now sits at that position.
+    const validIds = new Set((state.fields || []).map((f) => f.id));
+    for (const [id, value] of draft.changed || []) if (validIds.has(id)) state.changed.set(id, value);
+    for (const [id, value] of draft.changedAlt || []) if (validIds.has(id)) state.changedAlt.set(id, value);
     if (typeof window.renderFields === 'function') {
       window.renderFields(state.fields);
     }
@@ -242,10 +266,16 @@
     wireDialog();
   }
 
+  // When a workspace is loaded/swapped, drop drafts belonging to other folders.
+  document.addEventListener('cms:workspace-changed', () => {
+    try { purgeOtherWorkspaces(); } catch (e) { /* ignore */ }
+  });
+
   window.cmsDrafts = {
     persist,
     maybeRestore,
     clear: clearDraft,
+    purgeOtherWorkspaces,
     _persistNow: persistNow,   // exposed for tests
   };
 })();

@@ -38,7 +38,7 @@ Drop a folder in, get a browser-based editor, save your changes, get formatted +
 
 ## What is this?
 
-`cms-static` is a tiny Node.js CLI tool that **wraps any static site folder with a CMS-like editing UI**. You point it at a folder containing `.html`, `.css`, `.js`, and `images/`, and it:
+`cms-static` is a tiny Node.js CLI tool that **wraps any static site folder with a CMS-like editing UI**. You either **drop a folder into the browser** (drop mode) or **point it at a folder on disk** (classic mode) — a folder containing `.html`, `.css`, `.js`, and `images/` — and it:
 
 1. Walks the folder, finds every `.html` page.
 2. Auto-detects what's editable on each page using semantic HTML rules — no schema, no config files.
@@ -49,7 +49,7 @@ Drop a folder in, get a browser-based editor, save your changes, get formatted +
 5. On **Build**, it produces:
    - `_minified/` — runs your site's existing `build.js` to emit a deployable, compressed copy
    - `_formatted/` — a parallel mirror of source files, pretty-printed via `js-beautify`
-6. **AI chat (optional)**: bring a Gemini API key, click ✨ AI in the sidebar, and describe an edit in plain English. The agent only calls the same edit / clone / delete / move / undo endpoints the buttons do — multi-step or destructive plans surface an approval card before anything is written. See `design-flow.md §4.19`.
+6. **AI chat (optional)**: bring an **NVIDIA API key** (hosted Gemma), click ✨ AI in the sidebar, and describe an edit in plain English. The agent only calls the same edit / clone / delete / move / undo endpoints the buttons do — multi-step or destructive plans surface an approval card before anything is written. See `design-flow.md §4.19` and [cost.md](./cost.md).
 7. **Inline edit**: hover any text in the live preview → outline appears. Click → type. Floating Done / Cancel bar appears above the element. Changes flow through the same sidebar change-tracker; Save / Undo / Build are unaffected. Carousels, forms, and metadata still use the sidebar. See `design-flow.md §4.20`.
 8. **Draft safety net**: every keystroke auto-saves to `localStorage`. Accidental refresh, tab close, or browser crash → reopen the editor and a banner offers to restore your unsaved edits. Pressing ⌘R / Ctrl+R / F5 with unsaved changes shows a Save & reload / Discard & reload / Cancel dialog instead of the generic browser prompt. See `design-flow.md §4.21`.
 9. **SEO validation**: a page with 2+ `<h1>` tags surfaces a warning card listing each one with click-to-jump-to-sidebar, plus a toast on each transition. Extensible — drop a new `checkX(fields)` function in `validation.js` for additional rules. See `design-flow.md §4.22`.
@@ -82,34 +82,46 @@ You need **Node.js ≥ 18** installed.
 
 ```bash
 cd /home/abhishek/cms-static
-npm install              # one time, ~2 seconds, installs 5 deps + their tree
+npm install              # one time, installs deps + their tree
 ```
 
-Then run it pointing at any static-site folder:
+There are **two ways to run it.**
+
+### Drop mode (default — no folder argument)
+
+Start with no folder, then drag a site folder into the browser:
+
+```bash
+node bin/cli.js
+```
+
+```
+  cms-static  v0.2
+  --------------------------------------------------
+  Site:    (none yet — drop a folder in the editor)
+  Editor:  http://localhost:5174/__cms/
+```
+
+Open the **Editor** URL. You'll see a **drop zone** — drag a folder of static
+HTML/CSS/JS onto it, click **Choose a folder…**, or upload a **.zip**. The app
+holds a private working copy locally (never uploaded to the cloud, auto-wiped
+when you close it), you edit, and when you're done you click **Export** to
+download the final **minified** site as a `.zip`. `node_modules`, `.git`, and
+build output are skipped automatically on upload.
+
+### Classic mode (point at a folder on disk)
+
+Edit a folder in place, exactly like before — this also unlocks the **Git panel**
+(commit/push), since the folder is durable and yours:
 
 ```bash
 node bin/cli.js /path/to/your/static/site
 ```
 
-You'll see:
-
-```
-  cms-static  v0.1
-  --------------------------------------------------
-  Site:    /path/to/your/static/site
-  Editor:  http://localhost:5174/__cms/
-
-  Open the Editor URL in your browser.
-  Ctrl+C to stop.
-```
-
-Open the **Editor** URL in your browser. Done.
-
-To run on the Kavin Hotels demo site (already configured on this machine):
+Different port (default `5174`) in either mode:
 
 ```bash
-cd /home/abhishek/cms-static
-node bin/cli.js /home/abhishek/kavinhotels/dist
+PORT=8080 node bin/cli.js
 ```
 
 ---

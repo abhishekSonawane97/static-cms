@@ -24,24 +24,38 @@
   // --------------------------------------------------------
   // Boot
   // --------------------------------------------------------
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', wireOnboardDialog);
 
-  async function init() {
-    await refreshState();
-    wireOnboardDialog();
-    if (!state.git) return;
+  // Git is driven by workspace state — it only makes sense for a classic
+  // (durable, user-owned) folder. In drop mode the workspace is an ephemeral
+  // temp dir, so the panel stays hidden and no polling runs.
+  document.addEventListener('cms:workspace-changed', (e) => {
+    onWorkspaceChange((e && e.detail) || { loaded: false });
+  });
 
-    // Decide what to show first
-    if (!state.git.installed) {
-      renderPanel(); // shows "git not installed" notice
+  let wsGen = 0;   // bumped on every workspace change; guards the async gap below
+
+  async function onWorkspaceChange(info) {
+    const gen = ++wsGen;
+    // Tear down any running poll first (also covers workspace swaps).
+    if (state.pollHandle) { clearInterval(state.pollHandle); state.pollHandle = null; }
+
+    const panel = $('#gitPanel');
+    if (!info || !info.loaded || info.mode !== 'classic') {
+      if (panel) panel.hidden = true;
+      state.git = null;
       return;
     }
-    if (!state.git.isRepo && localStorage.getItem(SKIP_KEY) !== '1') {
-      // Auto-open the onboarding modal on first run
+
+    await refreshState();
+    // A newer workspace-changed event superseded us during the await — bail so
+    // we don't re-show the panel or re-arm a poll for a workspace that's gone.
+    if (gen !== wsGen) return;
+    if (!state.git) return;
+    if (state.git.installed && !state.git.isRepo && localStorage.getItem(SKIP_KEY) !== '1') {
       openOnboardDialog();
     }
     renderPanel();
-    // Light polling to keep ahead/behind fresh while user works
     state.pollHandle = setInterval(refreshState, 8000);
   }
 

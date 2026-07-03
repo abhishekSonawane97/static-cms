@@ -196,6 +196,18 @@
       }
       if (chat.open) renderChat(); // refresh scope dropdown for new page
     });
+
+    // A workspace swap invalidates all per-page chat state; close the panel if
+    // the new state has no workspace at all.
+    document.addEventListener('cms:workspace-changed', (e) => {
+      const info = (e && e.detail) || {};
+      chat.history = [];
+      chat.scope = null;
+      chat.pendingPlan = [];
+      chat.page = (window.cmsState && window.cmsState.currentPage) || null;
+      if (!info.loaded) closeChatPanel();
+      else if (chat.open) renderChat();
+    });
   }
 
   function autosizeInput() {

@@ -32,11 +32,31 @@ it is the model everything else is built on.
 
 ---
 
+> **v0.2 — drop mode.** The tool now runs in two modes. With **no argument**
+> (`node bin/cli.js`) it starts with *no site*; the user uploads a folder in the
+> browser, which is held in an app-managed temp **workspace**, edited, and
+> exported as a zip. With a **folder argument** (`node bin/cli.js <folder>`) it
+> behaves as before ("classic mode"), pinning that folder as the workspace and
+> enabling the Git panel. The new flows are documented in
+> **[§18 Workspace lifecycle](#18-workspace-lifecycle-drop-mode)**,
+> **[§19 Folder ingestion](#19-folder-ingestion-drop-mode)**, and
+> **[§20 Export](#20-export)**. The sections below describe the shared editing
+> engine, which is identical in both modes once a workspace is active.
+
 ## 1. Startup / boot
 
-**Trigger:** `node bin/cli.js <site-folder>` (or `cms-static <site-folder>` once linked).
+**Trigger:** `node bin/cli.js` (drop mode) **or** `node bin/cli.js <site-folder>` (classic mode).
 
-**Files:** [bin/cli.js](./bin/cli.js) → [src/server.js](./src/server.js)
+**Files:** [bin/cli.js](./bin/cli.js) → [src/server.js](./src/server.js) → [src/workspace.js](./src/workspace.js)
+
+In **classic mode** cli.js validates the folder (exists, is a directory, not
+minified) and calls `startServer(port, { initialRoot })`, which pins it via
+`workspace.pin()`. In **drop mode** there is no folder — `startServer(port, {})`
+starts with `workspace.getRoot() === null`, and every site route returns
+`409 { code:'NO_WORKSPACE' }` until an upload completes. `express.static` is now
+a **dynamic wrapper** that rebuilds its instance whenever the active root
+changes (see [§18](#18-workspace-lifecycle-drop-mode)). The rest of boot
+(below) is unchanged.
 
 ```
 node bin/cli.js /path/to/site
@@ -352,19 +372,27 @@ on server restart, and it tracks only structural ops (not field saves; use Git f
 
 Two independent pipelines, both rooted at the site folder:
 
+> **v0.2:** the minifier is now **built in** — it no longer spawns the site's own
+> `build.js` (arbitrary code execution on uploaded folders, and dead in practice
+> since the real site uses `build.mjs`). Deps: `html-minifier-terser`, `terser`,
+> `clean-css`.
+
 ```
 runBuild(siteRoot)
-  ├─ _minified/  : if <siteRoot>/build.js exists → spawn `node build.js` (cwd=siteRoot)
-  │                ok:true{log} on exit 0; else { ok:false, error }
-  │                no build.js → { ok:false, error:"No build.js…; skipped minification." }
-  └─ _formatted/ : wipe + recreate, recursive walk, skip
-                   (_minified _formatted node_modules build.js package.json package-lock.json .git .vscode .idea + dotfiles)
+  ├─ _minified/  : built-in generateMinified() — wipe + recreate, walk (shared SKIP set)
+  │                .html → html-minifier-terser (+ ?v= sha256-10 cache-bust rewrite)
+  │                .js   → terser {compress passes:2, mangle}  (skips *.min.*)
+  │                .css  → clean-css level 1 · else copy · per-file copy-as-is fallback
+  │                returns { ok, files, html, css, js, other, bytesIn, bytesOut, failures }
+  └─ _formatted/ : wipe + recreate, recursive walk, shared SKIP set
                    .html → beautify.html · .css → beautify.css · .js → beautify.js · else copy
                    returns { ok, formatted, copied }
 ```
 
-`_minified/` is your deployable artifact (depends entirely on the site's own `build.js`).
-`_formatted/` is a pretty-printed mirror of source. Both should be `.gitignore`d.
+`_minified/` is your deployable artifact and what **Export** ([§20](#20-export))
+ships. `_formatted/` is a pretty-printed mirror of source. Both are inside the
+workspace and excluded from source exports; both should be `.gitignore`d in
+classic mode.
 
 ---
 
@@ -522,6 +550,10 @@ re-render). It is built to extend: add a `checkX(fields)` returning the same
 |---|---|---|
 | `GET /` | redirect to editor | server.js |
 | `GET /__cms/*` | editor static assets | server.js / editor/* |
+| `GET /__cms/api/workspace` | [18](#18-workspace-lifecycle-drop-mode) | workspace.js |
+| `DELETE /__cms/api/workspace` | [18](#18-workspace-lifecycle-drop-mode) (Start over) | workspace.js |
+| `POST /__cms/api/ingest/begin\|batch\|finish\|abort` | [19](#19-folder-ingestion-drop-mode) | ingest.js |
+| `GET /__cms/api/export?variant=` | [20](#20-export) | exporter.js |
 | `GET /__cms/api/pages` | [3](#3-page-discovery--the-page-picker) | discovery.js |
 | `GET /__cms/api/fields?page=` | [2](#2-field-extraction-the-core-model) / [4](#4-loading-a-page-in-the-editor) | extractor.js |
 | `POST /__cms/api/save` | [7](#7-the-save-round-trip) | applier.js |
@@ -541,3 +573,109 @@ re-render). It is built to extend: add a `checkX(fields)` returning the same
 | `GET /<anything>` | static site (preview), `Cache-Control: no-store` | server.js |
 </content>
 </invoke>
+
+---
+
+## 18. Workspace lifecycle (drop mode)
+
+**File:** [src/workspace.js](./src/workspace.js) ↔ [src/server.js](./src/server.js)
+
+There is **one active workspace** at a time (local single-user tool). It is the
+single seam every site route resolves through — routes read `req.siteRoot`,
+which `requireWorkspace` sets from `workspace.getRoot()` (and freezes per-request
+so a mid-request swap can't mix two roots).
+
+```
+os.tmpdir()/cms-static/                      (mode 0700, created on init)
+   ws-<hex16>/            ← a promoted (active) drop workspace
+      .cms-workspace.json ← { id, name, createdAt, lastAccess }  (dot-prefixed → invisible to discovery/build/export)
+   ws-<hex16>-staging/    ← an in-progress ingest (see §19); renamed → ws-<hex16> on finish
+```
+
+- **classic mode:** `workspace.pin(dir)` marks the user's own folder active with
+  `pinned:true, mode:'classic'` — **never swept, never deleted**.
+- **drop mode:** ingest `finish` calls `workspace.activate({root, id, name})` with
+  `mode:'drop'`. Activating a new workspace first **discards the previous drop
+  workspace** (rm) and calls `sectionOps.clearAll()` so undo history can't leak
+  across folders.
+- **Dynamic static:** `express.static` binds its root at creation, so the server
+  memoizes one instance per root string and rebuilds it only when the root
+  changes; `Cache-Control: no-store` neutralises stale-after-swap.
+- **TTL sweep:** on start + hourly (`unref`'d), drop workspaces with
+  `lastAccess > 24h` and orphaned staging dirs `> 1h` are removed. `bumpMutation`
+  touches `lastAccess` on every write so an actively-edited site is never swept.
+- **Exit cleanup:** `SIGINT`/`SIGTERM`/`exit` remove the active *drop* workspace
+  (pinned classic dirs are spared). A hard `kill -9` is covered by the next
+  start's sweep.
+- **Reset:** `DELETE /__cms/api/workspace` (Start over) discards the active drop
+  workspace and returns the editor to the drop zone; `GET /__cms/api/workspace`
+  reports `{ loaded, id, name, mode, pageCount }` (the absolute path is hidden in
+  drop mode).
+
+## 19. Folder ingestion (drop mode)
+
+**Files:** [src/editor/ingest.js](./src/editor/ingest.js) (client) ↔ [src/ingest.js](./src/ingest.js) (server)
+
+The browser can't hand the server a directory, so the client walks the folder
+and streams files in capped multipart batches. **Three collectors** normalise to
+one stream of `{ relPath, file }`:
+
+1. **Folder picker** — `<input webkitdirectory>`; strip the picked folder name
+   (the shared common-root) — that name becomes the workspace name.
+2. **Drag-and-drop** — `webkitGetAsEntry` (entries grabbed *synchronously* before
+   any await), recursive traversal with the **`readEntries`-until-empty loop**
+   (Chromium returns ≤100/call), pruning skip-dirs *before* descending so
+   `node_modules` is never enumerated.
+3. **.zip** — unpacked **client-side** with vendored `fflate`, skip-filtered
+   before inflate, `__MACOSX/` and directory entries dropped.
+
+A shared filter skips `node_modules/.git/_minified/_formatted/.vscode/.idea`,
+dot-entries, `Thumbs.db/desktop.ini`, and files > 25 MB (with a visible
+skipped-list). Then the **uploader**:
+
+```
+POST /ingest/begin   {name,totalFiles,totalBytes}  → {uploadId}    (413 if >5000 files / >500MB)
+     server mkdirs ws-<uploadId>-staging, records an in-memory session (30-min TTL)
+POST /ingest/batch × N  (pool of 3 XHRs, batch = 40 files or 8MB)
+     multipart: files[] + uploadId + paths(JSON, index-aligned & authoritative)
+     dedicated multer instance (memoryStorage, fileSize 25MB, files 64)
+     each file → resolveInRoot(staging, relPath) + server-side skip re-check → write; record in `received`
+     xhr.upload.onprogress drives a byte-accurate progress bar; per-batch 3 retries w/ backoff
+POST /ingest/finish  {uploadId, manifest:[{path,size}]}
+     diff manifest vs received → missing? 409 {missing:[…]} (client re-uploads just those)
+     complete → ATOMIC rename staging → ws-<uploadId>, workspace.activate(), clearAll history
+                warn if 0 pages or index.html looks minified → {ok, name, pageCount, warnings}
+POST /ingest/abort   {uploadId}  → rm staging
+```
+
+Nothing is promoted out of staging until `finish` confirms every manifest file
+arrived, so an abandoned upload never corrupts an active workspace. On success
+the client calls `refreshWorkspaceState()` and the editor swaps from the drop
+zone to the normal two-pane view.
+
+## 20. Export
+
+**Files:** [src/exporter.js](./src/exporter.js) ↔ [src/server.js](./src/server.js) `/api/export`
+
+**Trigger:** ⤓ Export → the browser navigates to
+`GET /__cms/api/export?variant=minified` via a hidden `<a download>`.
+
+```
+export?variant=minified
+  ├─ dirty check (O(1), no mtime scan): rebuild iff
+  │     builtForId !== current workspace id   (new site since last build)
+  │     OR lastMutationAt > lastBuildAt         (edited since last build)
+  │     OR _minified/ missing
+  ├─ archiver('zip', level 6) streamed to res (flat RSS even at 200MB sites)
+  │     manual SKIP-aware walk (never ships node_modules/.git/_formatted/_minified-nesting)
+  │     store:true for jpg/png/webp/gif/avif/mp4/woff/woff2/pdf (already compressed)
+  │     symlinks skipped (never archived)
+  │     entries under "<siteName>-minified/" root prefix
+  │     Content-Disposition: attachment; filename="<siteName>-minified.zip" (+ RFC5987)
+  └─ res.on('close') → archive.abort()  ·  error → destroy response
+```
+
+`variant` is parametric internally (`minified` | `formatted` | `source`), but the
+UI only exposes **minified** — the deployable artifact. `siteName` comes from the
+workspace metadata (the dropped folder's name), `path.basename(root)` in classic
+mode.

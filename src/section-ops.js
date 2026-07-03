@@ -45,6 +45,13 @@ function clearHistory(page) {
   history.delete(page);
 }
 
+// Wipe ALL per-page undo stacks. Called on every workspace switch/discard so a
+// snapshot captured in one dropped folder can never be restored into another
+// folder that happens to share a page path (e.g. index.html).
+function clearAll() {
+  history.clear();
+}
+
 // ---------------------------------------------------------------------------
 //   Section operations
 // ---------------------------------------------------------------------------
@@ -122,4 +129,5 @@ module.exports = {
   popHistory,
   historyDepth,
   clearHistory,
+  clearAll,
 };

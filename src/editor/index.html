@@ -19,6 +19,8 @@
         <div class="brand">
           <strong>cms-static</strong>
           <span class="muted" id="rootLabel"></span>
+          <button class="btn small start-over-btn" id="startOverBtn" hidden
+                  title="Close this site and load another">⏏ Start over</button>
         </div>
         <select id="pagePicker" aria-label="Page"></select>
       </header>
@@ -55,18 +57,56 @@
           <span class="kbd-hint" aria-hidden="true">⌘ S</span>
         </button>
         <button id="buildBtn" class="btn" title="Run minify + format pipelines">⬇ Build</button>
+        <button id="exportBtn" class="btn" title="Download the final minified site as a .zip">⤓ Export</button>
         <button id="aiFab" class="btn ai-fab" title="AI assistant — chat to edit">✨ AI</button>
         <span id="statusBar" class="status muted" aria-live="polite"></span>
       </footer>
     </aside>
 
     <main class="preview">
-      <div class="preview-toolbar">
-        <span id="previewPath" class="muted">No page loaded</span>
-        <button id="refreshBtn" class="btn small" title="Reload preview">⟳</button>
-        <a id="openInTab" class="btn small" target="_blank" rel="noopener" hidden>↗ Open</a>
+      <!-- Drop zone — shown until a workspace is loaded -->
+      <div class="drop-zone" id="dropZone" hidden>
+        <div class="drop-card" id="dropCard">
+          <div class="drop-emoji" aria-hidden="true">📁</div>
+          <h1 class="drop-title">Drop your site folder here</h1>
+          <p class="drop-sub">Drag a folder of static HTML/CSS/JS onto this area, or:</p>
+          <div class="drop-actions">
+            <button class="btn primary" id="pickFolderBtn">Choose a folder…</button>
+            <button class="btn" id="pickZipBtn">Upload a .zip…</button>
+          </div>
+          <p class="drop-note muted small">
+            Nothing is uploaded to the cloud — the folder is held locally by the app while you edit,
+            and disappears when you close it. <code>node_modules</code>, <code>.git</code>, and build
+            output are skipped automatically.
+          </p>
+          <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+          <input type="file" id="zipInput" accept=".zip,application/zip" hidden>
+        </div>
+
+        <!-- Progress — shown during scan/upload -->
+        <div class="drop-progress" id="dropProgress" hidden>
+          <div class="drop-progress-head">
+            <strong id="dropPhase">Scanning…</strong>
+            <button class="btn small" id="dropCancelBtn" title="Cancel upload">Cancel</button>
+          </div>
+          <div class="drop-bar"><div class="drop-bar-fill" id="dropBarFill"></div></div>
+          <div class="drop-progress-meta muted small" id="dropMeta"></div>
+          <details class="drop-skipped" id="dropSkipped" hidden>
+            <summary><span id="dropSkippedCount">0</span> files skipped</summary>
+            <ul class="drop-skipped-list" id="dropSkippedList"></ul>
+          </details>
+          <p class="drop-error" id="dropError" hidden></p>
+        </div>
       </div>
-      <iframe id="preview" src="about:blank" title="preview"></iframe>
+
+      <div class="preview-pane" id="previewPane">
+        <div class="preview-toolbar">
+          <span id="previewPath" class="muted">No page loaded</span>
+          <button id="refreshBtn" class="btn small" title="Reload preview">⟳</button>
+          <a id="openInTab" class="btn small" target="_blank" rel="noopener" hidden>↗ Open</a>
+        </div>
+        <iframe id="preview" src="about:blank" title="preview"></iframe>
+      </div>
     </main>
   </div>
 
@@ -215,7 +255,9 @@
   </dialog>
 
   <script src="https://unpkg.com/cropperjs@1.6.1/dist/cropper.min.js"></script>
+  <script src="vendor/fflate.min.js"></script>
   <script src="editor.js"></script>
+  <script src="ingest.js"></script>
   <script src="cropper-modal.js"></script>
   <script src="git-panel.js"></script>
   <script src="ai.js"></script>

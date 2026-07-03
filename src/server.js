@@ -15,6 +15,10 @@ const { cloneSection } = require('./cloner');
 const sectionOps = require('./section-ops');
 const beautify = require('js-beautify').html;
 const git = require('./git');
+const workspace = require('./workspace');
+const ingest = require('./ingest');
+const { streamExport, isVariant } = require('./exporter');
+const { resolveInRoot } = require('./safe-path');
 
 // Shared js-beautify settings for any HTML write through this module
 const BEAUTIFY_OPTS = {
@@ -32,17 +36,26 @@ const BEAUTIFY_OPTS = {
 const SECTION_SELECTOR_RE =
   /^body\s*>\s*main(?:#[\w-]+)?\s*>\s*section(?:#[\w-]+|:nth-of-type\(\d+\))?$/;
 
-function safePath(siteRoot, rel) {
-  const abs = path.resolve(siteRoot, rel.replace(/^\/+/, ''));
-  if (!abs.startsWith(path.resolve(siteRoot))) {
-    throw new Error('Path escapes site root: ' + rel);
-  }
-  return abs;
-}
-
-function startServer(siteRoot, port) {
+/**
+ * startServer(port, { initialRoot, initialName })
+ *   - initialRoot present  → classic mode: pin that folder as the workspace.
+ *   - initialRoot absent    → drop mode: no workspace until the browser uploads one.
+ */
+function startServer(port, opts = {}) {
   const app = express();
   app.use(express.json({ limit: '20mb' }));
+
+  workspace.initLifecycle();
+  if (opts.initialRoot) {
+    workspace.pin(opts.initialRoot, opts.initialName);
+  }
+
+  // Export dirty-tracking (O(1), no mtime scans). All mutations flow through the
+  // handlers below, so bumping these there is sufficient.
+  let lastMutationAt = 0;
+  let lastBuildAt = 0;
+  let builtForId = null;
+  const bumpMutation = () => { lastMutationAt = Date.now(); workspace.touch(); };
 
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -50,30 +63,67 @@ function startServer(siteRoot, port) {
   });
 
   // ---------------------------------------------------------------
-  // Editor frontend at /__cms/
+  // Editor frontend at /__cms/ (root-independent — must work with no workspace)
   // ---------------------------------------------------------------
   app.use('/__cms', express.static(path.join(__dirname, 'editor')));
 
   // ---------------------------------------------------------------
-  // API at /__cms/api/
+  // Workspace guard — 409 { code:'NO_WORKSPACE' } until a site is loaded.
+  // Freezes the root per-request so a mid-request swap can't mix two roots.
+  // ---------------------------------------------------------------
+  function requireWorkspace(req, res, next) {
+    const root = workspace.getRoot();
+    if (!root) {
+      return res.status(409).json({ error: 'No workspace loaded. Upload a site folder first.', code: 'NO_WORKSPACE' });
+    }
+    req.siteRoot = root;
+    next();
+  }
+
+  // ---------------------------------------------------------------
+  // Workspace status / reset
+  // ---------------------------------------------------------------
+  app.get('/__cms/api/workspace', async (req, res) => {
+    const info = workspace.getInfo();
+    let pageCount = 0;
+    if (info.loaded) {
+      try { pageCount = (await listPages(workspace.getRoot())).length; } catch (e) { /* 0 */ }
+    }
+    res.json({ ...info, pageCount });
+  });
+
+  app.delete('/__cms/api/workspace', (req, res) => {
+    workspace.discard();
+    lastMutationAt = 0; lastBuildAt = 0; builtForId = null;
+    res.json({ ok: true, loaded: false });
+  });
+
+  // ---------------------------------------------------------------
+  // Folder ingestion (drop mode). No workspace guard — this is how one is made.
+  // ---------------------------------------------------------------
+  app.post('/__cms/api/ingest/begin', ingest.begin);
+  app.post('/__cms/api/ingest/batch', ingest.ingestUpload.array('files', 64), ingest.batch);
+  app.post('/__cms/api/ingest/finish', ingest.finish);
+  app.post('/__cms/api/ingest/abort', ingest.abort);
+
+  // ---------------------------------------------------------------
+  // API at /__cms/api/  (all workspace-guarded unless noted)
   // ---------------------------------------------------------------
 
-  // List all editable HTML pages in the site
-  app.get('/__cms/api/pages', async (req, res) => {
+  app.get('/__cms/api/pages', requireWorkspace, async (req, res) => {
     try {
-      const pages = await listPages(siteRoot);
-      res.json({ pages, root: siteRoot });
+      const pages = await listPages(req.siteRoot);
+      res.json({ pages, workspace: workspace.getInfo() });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });
 
-  // Extract editable fields from a single page
-  app.get('/__cms/api/fields', async (req, res) => {
+  app.get('/__cms/api/fields', requireWorkspace, async (req, res) => {
     try {
       const page = req.query.page;
       if (!page) return res.status(400).json({ error: 'missing page' });
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
       if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
       const html = fs.readFileSync(filePath, 'utf8');
       const fields = extractFields(html, page);
@@ -84,17 +134,18 @@ function startServer(siteRoot, port) {
     }
   });
 
-  // Apply changes back to source HTML
-  app.post('/__cms/api/save', async (req, res) => {
+  app.post('/__cms/api/save', requireWorkspace, async (req, res) => {
     try {
       const { page, changes } = req.body || {};
       if (!page || !Array.isArray(changes)) {
         return res.status(400).json({ error: 'invalid payload' });
       }
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
+      if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
       const html = fs.readFileSync(filePath, 'utf8');
       const updated = await applyChanges(html, changes);
       fs.writeFileSync(filePath, updated);
+      bumpMutation();
       res.json({ ok: true, bytes: Buffer.byteLength(updated) });
     } catch (err) {
       console.error('[save error]', err);
@@ -103,17 +154,18 @@ function startServer(siteRoot, port) {
   });
 
   // Proxy an external image so the browser can read its pixels into a canvas.
-  // Used by the cropper for "Crop existing" on a remote URL.
+  // No workspace needed — it only touches an external URL.
   app.get('/__cms/api/image-proxy', (req, res) => imageProxy(req, res));
 
-  // Image upload (post-cropper). Body: multipart with 'image' file + 'destPath' string.
-  app.post('/__cms/api/upload-image', upload.single('image'), async (req, res) => {
+  // Image upload (post-cropper). Body: multipart with 'image' file + 'destPath'.
+  app.post('/__cms/api/upload-image', requireWorkspace, upload.single('image'), async (req, res) => {
     try {
       const destPath = (req.body && req.body.destPath) || '';
       if (!destPath || !req.file) {
         return res.status(400).json({ error: 'missing destPath or image' });
       }
-      const result = await handleImageUpload(siteRoot, destPath, req.file.buffer);
+      const result = await handleImageUpload(req.siteRoot, destPath, req.file.buffer);
+      bumpMutation();
       res.json(result);
     } catch (err) {
       console.error('[upload error]', err);
@@ -122,34 +174,32 @@ function startServer(siteRoot, port) {
   });
 
   // ---- Section ops: clone / delete / move / undo ------------------------
-  // All four push the pre-write HTML onto a per-page in-memory stack so the
-  // user gets a one-click Undo per page.
 
-  // Clone a <section> direct child of <main>. Body: { page, selector }.
-  app.post('/__cms/api/clone-section', async (req, res) => {
+  app.post('/__cms/api/clone-section', requireWorkspace, async (req, res) => {
     try {
       const { page, selector } = req.body || {};
       if (!page || !selector) return res.status(400).json({ error: 'missing page or selector' });
       if (!SECTION_SELECTOR_RE.test(selector)) {
         return res.status(400).json({ error: 'selector must target a <section> directly under <main>' });
       }
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
       if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
 
       const html = fs.readFileSync(filePath, 'utf8');
       const formInside = sectionOps.subtreeContainsForm(html, selector);
       const result = cloneSection(html, selector);
 
-      sectionOps.pushHistory(page, html, 'clone');                         // history snapshot
+      sectionOps.pushHistory(page, html, 'clone');
       const pretty = beautify(result.html, BEAUTIFY_OPTS);
       fs.writeFileSync(filePath, pretty);
+      bumpMutation();
 
       res.json({
         ok: true,
         newId: result.newId,
         suffix: result.suffix,
         originalId: result.originalId,
-        formInside,                                                        // → frontend warns
+        formInside,
         sections: extractSections(pretty),
         undoAvailable: sectionOps.historyDepth(page) > 0,
       });
@@ -159,15 +209,14 @@ function startServer(siteRoot, port) {
     }
   });
 
-  // Delete a <section> direct child of <main>. Body: { page, selector }.
-  app.post('/__cms/api/delete-section', async (req, res) => {
+  app.post('/__cms/api/delete-section', requireWorkspace, async (req, res) => {
     try {
       const { page, selector } = req.body || {};
       if (!page || !selector) return res.status(400).json({ error: 'missing page or selector' });
       if (!SECTION_SELECTOR_RE.test(selector)) {
         return res.status(400).json({ error: 'selector must target a <section> directly under <main>' });
       }
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
       if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
 
       const html = fs.readFileSync(filePath, 'utf8');
@@ -176,6 +225,7 @@ function startServer(siteRoot, port) {
       sectionOps.pushHistory(page, html, 'delete');
       const pretty = beautify(result.html, BEAUTIFY_OPTS);
       fs.writeFileSync(filePath, pretty);
+      bumpMutation();
 
       res.json({
         ok: true,
@@ -189,9 +239,7 @@ function startServer(siteRoot, port) {
     }
   });
 
-  // Move a <section> up or down among its <section> siblings.
-  // Body: { page, selector, direction: 'up' | 'down' }.
-  app.post('/__cms/api/move-section', async (req, res) => {
+  app.post('/__cms/api/move-section', requireWorkspace, async (req, res) => {
     try {
       const { page, selector, direction } = req.body || {};
       if (!page || !selector || !direction) {
@@ -200,7 +248,7 @@ function startServer(siteRoot, port) {
       if (!SECTION_SELECTOR_RE.test(selector)) {
         return res.status(400).json({ error: 'selector must target a <section> directly under <main>' });
       }
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
       if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
 
       const html = fs.readFileSync(filePath, 'utf8');
@@ -209,6 +257,7 @@ function startServer(siteRoot, port) {
       sectionOps.pushHistory(page, html, 'move-' + direction);
       const pretty = beautify(result.html, BEAUTIFY_OPTS);
       fs.writeFileSync(filePath, pretty);
+      bumpMutation();
 
       res.json({
         ok: true,
@@ -222,19 +271,18 @@ function startServer(siteRoot, port) {
     }
   });
 
-  // Undo the most recent clone / delete / move on this page.
-  app.post('/__cms/api/undo', async (req, res) => {
+  app.post('/__cms/api/undo', requireWorkspace, async (req, res) => {
     try {
       const { page } = req.body || {};
       if (!page) return res.status(400).json({ error: 'missing page' });
-      const filePath = safePath(siteRoot, page);
+      const filePath = resolveInRoot(req.siteRoot, page);
       if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'page not found' });
 
       const entry = sectionOps.popHistory(page);
       if (!entry) return res.status(400).json({ error: 'nothing to undo for this page' });
 
-      // Restore the pre-action HTML verbatim. (Already pretty-printed when pushed.)
       fs.writeFileSync(filePath, entry.html);
+      bumpMutation();
       res.json({
         ok: true,
         action: entry.action,
@@ -247,17 +295,19 @@ function startServer(siteRoot, port) {
     }
   });
 
-  // Lightweight state poll — used by the Sections toolbar to show/disable Undo.
-  app.get('/__cms/api/undo-state', (req, res) => {
+  app.get('/__cms/api/undo-state', requireWorkspace, (req, res) => {
     const page = req.query.page;
     if (!page) return res.status(400).json({ error: 'missing page' });
     res.json({ undoAvailable: sectionOps.historyDepth(String(page)) > 0 });
   });
 
   // Run minify + format pipelines
-  app.post('/__cms/api/build', async (req, res) => {
+  app.post('/__cms/api/build', requireWorkspace, async (req, res) => {
     try {
-      const result = await runBuild(siteRoot);
+      const result = await runBuild(req.siteRoot);
+      lastBuildAt = Date.now();
+      builtForId = workspace.getInfo().id;
+      workspace.touch();
       res.json(result);
     } catch (err) {
       console.error('[build error]', err);
@@ -266,11 +316,34 @@ function startServer(siteRoot, port) {
   });
 
   // ---------------------------------------------------------------
+  // Export — stream a variant as a .zip. Auto-builds when stale.
+  // ---------------------------------------------------------------
+  app.get('/__cms/api/export', requireWorkspace, async (req, res) => {
+    try {
+      const variant = (req.query.variant || 'minified').toString();
+      if (!isVariant(variant)) return res.status(400).json({ error: 'unknown variant: ' + variant });
+
+      if (variant === 'minified' || variant === 'formatted') {
+        const outDir = path.join(req.siteRoot, '_' + variant);
+        const currentId = workspace.getInfo().id;
+        const stale = builtForId !== currentId || lastMutationAt > lastBuildAt;
+        if (stale || !fs.existsSync(outDir)) {
+          await runBuild(req.siteRoot);
+          lastBuildAt = Date.now();
+          builtForId = currentId;
+        }
+      }
+      const name = workspace.getInfo().name || path.basename(req.siteRoot);
+      await streamExport(req.siteRoot, variant, name, res);
+    } catch (err) {
+      console.error('[export error]', err);
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ---------------------------------------------------------------
   // LLM proxy — forwards browser POST to NVIDIA's chat-completions endpoint.
-  // Needed because integrate.api.nvidia.com does not send CORS headers, so a
-  // browser-to-NVIDIA fetch is blocked. The API key still lives in the user's
-  // localStorage; the server reads it from x-llm-key only long enough to set
-  // Authorization on the forwarded request. No logging, no caching.
+  // No workspace needed.
   // ---------------------------------------------------------------
   const LLM_UPSTREAM = 'https://integrate.api.nvidia.com/v1/chat/completions';
 
@@ -293,19 +366,45 @@ function startServer(siteRoot, port) {
          .set('content-type', upstream.headers.get('content-type') || 'application/json')
          .send(text);
     } catch (err) {
-      // never include the key in error output
       console.error('[llm proxy error]', err.message);
       res.status(502).json({ error: 'upstream unreachable: ' + err.message });
     }
   });
 
   // ---------------------------------------------------------------
-  // Git API: state / init / commit / push
+  // Git API — classic mode only. In drop mode the workspace is an ephemeral
+  // temp dir, so versioning it is meaningless AND git rev-parse could climb
+  // into an enclosing repo. requireClassicGit blocks it defensively.
   // ---------------------------------------------------------------
+  function requireClassicGit(req, res, next) {
+    const root = workspace.getRoot();
+    if (!root) return res.status(409).json({ error: 'No workspace loaded.', code: 'NO_WORKSPACE' });
+    if (workspace.getInfo().mode !== 'classic') {
+      return res.status(400).json({ error: 'Git is disabled for uploaded folders.', code: 'GIT_DISABLED' });
+    }
+    req.siteRoot = root;
+    next();
+  }
 
-  app.get('/__cms/api/git/state', async (req, res) => {
+  // Reject git actions when the repo toplevel is not the workspace itself
+  // (prevents committing/pushing an enclosing ancestor repo).
+  async function assertRepoIsWorkspace(root) {
+    const top = await git.repoRoot(root);
+    if (!top) return; // not a repo yet (init handles that)
+    if (path.resolve(top) !== path.resolve(root)) {
+      const e = new Error('workspace is inside another git repo (' + top + '); refusing to operate on the enclosing repo');
+      e.code = 'ANCESTOR_REPO';
+      throw e;
+    }
+  }
+
+  app.get('/__cms/api/git/state', requireClassicGit, async (req, res) => {
     try {
-      const state = await git.fullState(siteRoot);
+      const state = await git.fullState(req.siteRoot);
+      // If the detected repo is an ancestor, don't present it as ours.
+      if (state.isRepo && state.repoRoot && path.resolve(state.repoRoot) !== path.resolve(req.siteRoot)) {
+        return res.json({ installed: state.installed, isRepo: false, enclosingRepo: state.repoRoot });
+      }
       res.json(state);
     } catch (err) {
       console.error('[git/state error]', err);
@@ -313,25 +412,24 @@ function startServer(siteRoot, port) {
     }
   });
 
-  app.post('/__cms/api/git/init', async (req, res) => {
+  app.post('/__cms/api/git/init', requireClassicGit, async (req, res) => {
     try {
       const { remote, message, userName, userEmail } = req.body || {};
-      // Always init at the site root we were given
       const installed = await git.isGitInstalled();
       if (!installed) return res.status(400).json({ error: 'git is not installed on this machine' });
 
-      const existingRoot = await git.repoRoot(siteRoot);
+      const existingRoot = await git.repoRoot(req.siteRoot);
       if (existingRoot) {
         return res.status(400).json({ error: 'Already a git repo at ' + existingRoot });
       }
 
-      await git.init(siteRoot, {
+      await git.init(req.siteRoot, {
         remote: remote || null,
         message: message || 'Initial commit from cms-static',
         userName: userName || undefined,
         userEmail: userEmail || undefined,
       });
-      const state = await git.fullState(siteRoot);
+      const state = await git.fullState(req.siteRoot);
       res.json({ ok: true, state });
     } catch (err) {
       console.error('[git/init error]', err);
@@ -339,54 +437,83 @@ function startServer(siteRoot, port) {
     }
   });
 
-  app.post('/__cms/api/git/commit', async (req, res) => {
+  app.post('/__cms/api/git/commit', requireClassicGit, async (req, res) => {
     try {
       const { message, files } = req.body || {};
       if (!message || !message.trim()) {
         return res.status(400).json({ error: 'commit message required' });
       }
-      const root = await git.repoRoot(siteRoot);
+      await assertRepoIsWorkspace(req.siteRoot);
+      const root = await git.repoRoot(req.siteRoot);
       if (!root) return res.status(400).json({ error: 'not a git repo' });
       const result = await git.commit(root, message, Array.isArray(files) ? files : null);
-      const state = await git.fullState(siteRoot);
+      const state = await git.fullState(req.siteRoot);
       res.json({ ok: true, result, state });
     } catch (err) {
       console.error('[git/commit error]', err);
-      res.status(500).json({ error: err.message });
+      res.status(err.code === 'ANCESTOR_REPO' ? 400 : 500).json({ error: err.message, code: err.code });
     }
   });
 
-  app.post('/__cms/api/git/push', async (req, res) => {
+  app.post('/__cms/api/git/push', requireClassicGit, async (req, res) => {
     try {
-      const root = await git.repoRoot(siteRoot);
+      await assertRepoIsWorkspace(req.siteRoot);
+      const root = await git.repoRoot(req.siteRoot);
       if (!root) return res.status(400).json({ error: 'not a git repo' });
       if (!(await git.hasRemote(root))) {
         return res.status(400).json({ error: 'no remote configured (origin)' });
       }
       const result = await git.push(root);
-      const state = await git.fullState(siteRoot);
+      const state = await git.fullState(req.siteRoot);
       res.json({ ok: true, result, state });
     } catch (err) {
       console.error('[git/push error]', err);
-      res.status(500).json({ error: err.message });
+      res.status(err.code === 'ANCESTOR_REPO' ? 400 : 500).json({ error: err.message, code: err.code });
     }
   });
 
-  // Redirect bare / to the editor (must come BEFORE static, otherwise
-  // static will serve siteRoot/index.html instead).
+  // Redirect bare / to the editor (BEFORE the dynamic static mount).
   app.get('/', (req, res) => res.redirect('/__cms/'));
 
   // ---------------------------------------------------------------
-  // Static serve everything else from the site root
-  // (so /index.html, /images/..., /styles.css all work natively)
+  // Dynamic static serve of the active workspace. express.static binds its
+  // root at creation, so we memoize one instance per root string and rebuild
+  // only when the workspace changes. Cache-Control: no-store neutralises
+  // stale-after-swap.
   // ---------------------------------------------------------------
-  app.use(express.static(siteRoot, {
-    extensions: ['html'],
-    setHeaders(res) {
-      // disable caching so edits show immediately
-      res.setHeader('Cache-Control', 'no-store');
+  let staticMw = null;
+  let staticRoot = null;
+  app.use((req, res, next) => {
+    const root = workspace.getRoot();
+    if (!root) return next();
+    if (root !== staticRoot) {
+      staticRoot = root;
+      staticMw = express.static(root, {
+        extensions: ['html'],
+        setHeaders(r) { r.setHeader('Cache-Control', 'no-store'); },
+      });
     }
-  }));
+    return staticMw(req, res, next);
+  });
+
+  // Terminal handler: no workspace / unmatched path.
+  app.use((req, res) => {
+    if (req.path.startsWith('/__cms/api/')) {
+      return res.status(404).json({ error: 'not found' });
+    }
+    // A workspace IS loaded but the static mount didn't find this file → it's a
+    // genuinely missing site asset. Return a real 404 so the preview iframe
+    // doesn't parse editor HTML as JS/CSS. Only redirect to the editor when no
+    // workspace is loaded AND this looks like a page navigation.
+    if (workspace.getRoot()) {
+      return res.status(404).send('Not found');
+    }
+    const accept = req.headers.accept || '';
+    if (req.method === 'GET' && accept.includes('text/html')) {
+      return res.redirect('/__cms/');
+    }
+    res.status(404).send('Not found');
+  });
 
   return new Promise((resolve, reject) => {
     const server = app.listen(port, () => resolve(port));

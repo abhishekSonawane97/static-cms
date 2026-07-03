@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { resolveInRoot } = require('./safe-path');
 
 let sharp;
 try {
@@ -29,10 +30,7 @@ async function handleImageUpload(siteRoot, destPath, buffer) {
   }
 
   const rel = destPath.replace(/^\/+/, '').replace(/\\/g, '/');
-  const abs = path.resolve(siteRoot, rel);
-  if (!abs.startsWith(path.resolve(siteRoot))) {
-    throw new Error('Path escapes site root: ' + destPath);
-  }
+  const abs = resolveInRoot(siteRoot, rel);
 
   fs.mkdirSync(path.dirname(abs), { recursive: true });
 

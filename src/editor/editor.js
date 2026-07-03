@@ -9,6 +9,7 @@ const state = {
   changed: new Map(),       // id -> new value
   changedAlt: new Map(),    // id -> new alt text (for images)
   pendingImages: new Map(), // id -> { blob, destPath }
+  workspace: { loaded: false }, // current workspace info from /api/workspace
 };
 
 // Expose for cropper-modal.js / ai.js / inline-edit.js to share state
@@ -16,13 +17,23 @@ window.cmsState = state;
 
 const $ = (sel) => document.querySelector(sel);
 
+// Run fn once the DOM (and the sibling editor scripts loaded after this one)
+// are ready. editor.js runs synchronously mid-parse, so at boot() time later
+// modules like window.cmsIngest aren't defined yet.
+function onReady(fn) {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn, { once: true });
+  else fn();
+}
+
 // -----------------------------------------------------------------------
 // Boot
 // -----------------------------------------------------------------------
 async function boot() {
-  await loadPages();
+  // --- One-time wiring (no network; must survive workspace swaps) ---
   $('#saveBtn').addEventListener('click', save);
   $('#buildBtn').addEventListener('click', build);
+  $('#exportBtn').addEventListener('click', exportSite);
+  $('#startOverBtn').addEventListener('click', startOver);
   $('#refreshBtn').addEventListener('click', () => {
     if (!state.currentPage) return;
     const iframe = $('#preview');
@@ -30,10 +41,22 @@ async function boot() {
     iframe.src = 'about:blank';
     setTimeout(() => { iframe.src = url; }, 30);
   });
+  // Page picker listener wired ONCE here (loadPages() used to re-add it on every
+  // call, which stacked duplicate handlers after a workspace swap).
+  $('#pagePicker').addEventListener('change', onPickerChange);
 
   initSidebarLayout(); // A1 + A2 — collapse + resize
   initKbdHelp();       // C3 — keyboard cheat-sheet
-  showFirstVisitTip(); // C2 — first-visit toast
+
+  // Drop-zone ingestion — wired on DOMContentLoaded because ingest.js is loaded
+  // AFTER editor.js, so window.cmsIngest isn't defined yet at this point in boot.
+  // On successful upload it reloads the workspace state.
+  onReady(() => {
+    if (window.cmsIngest) window.cmsIngest.init({ onLoaded: () => refreshWorkspaceState() });
+  });
+
+  // Decide the initial screen: drop zone (no workspace) or editor (loaded).
+  await refreshWorkspaceState();
 
   // Keyboard shortcuts
   document.addEventListener('keydown', (e) => {
@@ -67,6 +90,81 @@ function showFirstVisitTip() {
     );
     localStorage.setItem(FIRST_VISIT_KEY, '1');
   }, 700);
+}
+
+// -----------------------------------------------------------------------
+// Workspace state — drop-zone vs editor gating
+// -----------------------------------------------------------------------
+async function refreshWorkspaceState() {
+  let info = { loaded: false };
+  try {
+    const r = await fetch('/__cms/api/workspace');
+    if (r.ok) info = await r.json();
+  } catch (e) { info = { loaded: false }; }
+
+  setWorkspaceLoaded(info);
+
+  if (info.loaded) {
+    await loadPages();
+    loadPage('');                // welcome card — "loaded, no page picked" state
+    showFirstVisitTip();
+  }
+}
+
+function setWorkspaceLoaded(info) {
+  const loaded = !!(info && info.loaded);
+  state.workspace = info || { loaded: false };
+
+  const layout = $('#layout');
+  if (layout) layout.classList.toggle('no-workspace', !loaded);
+  const dz = $('#dropZone'); if (dz) dz.hidden = loaded;
+  const pane = $('#previewPane'); if (pane) pane.hidden = !loaded;
+
+  $('#rootLabel').textContent = loaded ? '· ' + (info.name || 'site') : '';
+  const startOverBtn = $('#startOverBtn'); if (startOverBtn) startOverBtn.hidden = !loaded;
+
+  // Gate controls that require a workspace.
+  const buildBtn = $('#buildBtn'); if (buildBtn) buildBtn.disabled = !loaded;
+  const exportBtn = $('#exportBtn'); if (exportBtn) exportBtn.disabled = !loaded;
+  const aiFab = $('#aiFab'); if (aiFab) aiFab.disabled = !loaded;
+  const picker = $('#pagePicker'); if (picker) picker.disabled = !loaded;
+
+  // Broadcast so ai.js / git-panel.js / validation.js can reset per-workspace state.
+  document.dispatchEvent(new CustomEvent('cms:workspace-changed', { detail: state.workspace }));
+
+  if (!loaded) {
+    state.currentPage = null;
+    state.fields = [];
+    state.sections = [];
+    state.changed.clear();
+    state.changedAlt.clear();
+    state.pendingImages.clear();
+    if (picker) picker.innerHTML = '<option value="">— select a page —</option>';
+    $('#preview').src = 'about:blank';
+    $('#previewPath').textContent = 'No page loaded';
+    $('#openInTab').hidden = true;
+    refreshSaveBtn();
+  }
+}
+
+async function startOver() {
+  if (hasChanges() && !window.confirm('You have unsaved edits. Close this site anyway?')) return;
+  if (!window.confirm('Close this site and load another?\n\nThe current working copy will be discarded (export first if you want to keep it).')) return;
+  try { await fetch('/__cms/api/workspace', { method: 'DELETE' }); } catch (e) { /* ignore */ }
+  await refreshWorkspaceState();
+  toast('Site closed — drop another folder to start again.', 'info');
+}
+
+function exportSite() {
+  if (!state.workspace || !state.workspace.loaded) return;
+  toast('Preparing your download… (building the minified site first)', 'info');
+  // A hidden <a download> triggers the browser download without leaving the editor.
+  const a = document.createElement('a');
+  a.href = '/__cms/api/export?variant=minified';
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 // -----------------------------------------------------------------------
@@ -182,7 +280,6 @@ function wireResizer(handle, layout) {
 async function loadPages() {
   const r = await fetchJson('/__cms/api/pages');
   state.pages = r.pages || [];
-  $('#rootLabel').textContent = '· ' + (r.root || '').split('/').slice(-2).join('/');
 
   // Group entries by group label, preserving server's sort order within each group
   const groups = new Map();
@@ -203,7 +300,25 @@ async function loadPages() {
     html += '</optgroup>';
   }
   picker.innerHTML = html;
-  picker.addEventListener('change', () => loadPage(picker.value));
+}
+
+// Guard page switches so unsaved edits (and unrecoverable image crops) aren't
+// silently dropped. Text/alt edits are flushed to a restorable draft first.
+function onPickerChange() {
+  const picker = $('#pagePicker');
+  const target = picker.value;
+  if (hasChanges()) {
+    if (window.cmsDrafts && window.cmsDrafts._persistNow) window.cmsDrafts._persistNow();
+    const hasCrops = state.pendingImages.size > 0;
+    const msg = hasCrops
+      ? 'You have unsaved edits on this page. Text edits are saved as a draft you can restore, but pending image crops will be lost. Switch pages anyway?'
+      : 'You have unsaved edits on this page. They are saved as a draft you can restore. Switch pages anyway?';
+    if (!window.confirm(msg)) {
+      picker.value = state.currentPage || '';
+      return;
+    }
+  }
+  loadPage(target);
 }
 
 async function loadPage(pagePath) {
@@ -835,6 +950,7 @@ function buildCommitMessage(page, changes) {
 }
 
 async function build() {
+  if (!state.workspace || !state.workspace.loaded) return;
   toast('Building…', 'info');
   try {
     const r = await fetch('/__cms/api/build', { method: 'POST' });
@@ -900,7 +1016,19 @@ function setStatus(msg, cls) {
 
 async function fetchJson(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error('HTTP ' + r.status);
+  if (!r.ok) {
+    // If the server lost its workspace (restart, discard, TTL sweep), fall back
+    // to the drop zone instead of leaving a broken editor on screen.
+    if (r.status === 409) {
+      try {
+        const j = await r.json();
+        if (j && j.code === 'NO_WORKSPACE') {
+          if (typeof setWorkspaceLoaded === 'function') setWorkspaceLoaded({ loaded: false });
+        }
+      } catch (e) { /* ignore */ }
+    }
+    throw new Error('HTTP ' + r.status);
+  }
   return r.json();
 }
 
